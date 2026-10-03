@@ -1,0 +1,13 @@
+set,room,item,item_id,measured_m,second_measure_m,tool,notes
+M,hall,wall,1,,,tape,"walls numbered clockwise from the entrance door"
+M,hall,wall,2,,,tape,
+M,hall,ceiling_height,1,,,tape,"room centre"
+M,hall,door_width,1,,,tape,"inside of frame; door to kitchen"
+M,hall,door_height,1,,,tape,
+M,kitchen,wall,1,,,tape,
+M,kitchen,window_width,1,,,tape,
+M,kitchen,window_height,1,,,tape,
+M,kitchen,window_sill_height,1,,,tape,"floor to bottom of window"
+D,bedroom,damage_water_stain_width,1,,,tape,"wall 2, bottom edge at 1.00 m"
+D,bedroom,damage_water_stain_height,1,,,tape,
+D,bedroom,damage_crack_length,1,,,tape,"wall 3"
