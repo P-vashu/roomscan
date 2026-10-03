@@ -30,8 +30,11 @@ from scipy import ndimage as ndi
 from scan_preview import load_scan, pick_convention, fuse, floor_ceiling, plane_peak
 
 PX = 0.02                 # grid cell size, metres
-BAND = (1.3, 2.0)         # wall band, metres above floor (above most furniture)
-FLOOR_TOL = 0.04          # floor slab half-thickness
+BAND = (0.3, 2.1)         # heights scanned for wall evidence, metres above floor
+SLICE = 0.10              # vertical slice thickness
+MIN_WALL_EXTENT = 0.6     # a wall cell must be occupied over >= this much height...
+MIN_WALL_TOP = 1.1        # ...and reach at least this high (beds, sofas, counters don't)
+FLOOR_BAND = (-0.12, 0.08)  # floor slab around the global floor; tolerates mild vertical drift
 SEED_HALF_WIDTH = 0.42    # free space must be wider than 2*this to seed a room
 MIN_ROOM_M2 = 0.6
 MIN_OPENING_M = 0.5
@@ -88,22 +91,52 @@ class Grid:
 
 
 def wall_map(pts, grid, floor_y, ceil_y):
-    lo = floor_y + BAND[0]
-    hi = floor_y + BAND[1]
-    if ceil_y is not None:
-        hi = min(hi, ceil_y - 0.15)
-    edges = np.linspace(lo, hi, 5)
-    hits = np.zeros((grid.H, grid.W), np.int32)
+    """A cell is wall if it is occupied across a tall vertical extent that reaches
+    above furniture height. Works for scans aimed low (floor_only) and high."""
+    hi = BAND[1] if ceil_y is None else min(BAND[1], ceil_y - floor_y - 0.15)
+    edges = np.arange(BAND[0], hi + 1e-6, SLICE)
+    count = np.zeros((grid.H, grid.W), np.int32)
+    top = np.zeros((grid.H, grid.W), np.float32)
+    rel = pts[:, 1] - floor_y
     for a, b in zip(edges[:-1], edges[1:]):
-        sl = pts[(pts[:, 1] >= a) & (pts[:, 1] < b)]
-        hits += (grid.occupancy(sl[:, [0, 2]]) > 0).astype(np.int32)
-    walls = (hits >= 3).astype(np.uint8)
+        sl = pts[(rel >= a) & (rel < b)]
+        occ = grid.occupancy(sl[:, [0, 2]]) > 0
+        count += occ
+        top[occ] = b
+    walls = ((count * SLICE >= MIN_WALL_EXTENT) & (top >= MIN_WALL_TOP)).astype(np.uint8)
     walls = cv2.morphologyEx(walls, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
-    # drop specks
     n, lab, stats, _ = cv2.connectedComponentsWithStats(walls, connectivity=8)
     keep = np.zeros(n, bool)
     keep[1:] = stats[1:, cv2.CC_STAT_AREA] * PX * PX >= 0.01
     return keep[lab].astype(np.uint8)
+
+
+def floor_flatness(pts, floor_y, block=0.5):
+    """Local floor height per 0.5 m block. A large spread means vertical drift
+    (or a genuinely uneven floor); either way it belongs in the report."""
+    rel = pts[:, 1] - floor_y
+    low = pts[(rel > -0.25) & (rel < 0.15)]
+    if len(low) == 0:
+        return None
+    key = np.floor(low[:, [0, 2]] / block).astype(np.int64)
+    _, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = inv.ravel()
+    order = np.argsort(inv)
+    inv_s, y_s = inv[order], low[order, 1]
+    starts = np.r_[0, np.nonzero(np.diff(inv_s))[0] + 1]
+    meds = []
+    for s, e in zip(starts, np.r_[starts[1:], len(inv_s)]):
+        if e - s >= 200:   # densest 1 cm slab = the floor, ignoring wall bases
+            v, c = np.unique(np.round(y_s[s:e] / 0.01).astype(np.int64), return_counts=True)
+            if c.max() >= 0.2 * (e - s):   # skip blocks that are only wall bases
+                meds.append(v[np.argmax(c)] * 0.01)
+    if not meds:
+        return None
+    meds = np.array(meds) - floor_y
+    return {"blocks": int(len(meds)),
+            "p5_m": round(float(np.percentile(meds, 5)), 3),
+            "p95_m": round(float(np.percentile(meds, 95)), 3),
+            "spread_m": round(float(np.percentile(meds, 95) - np.percentile(meds, 5)), 3)}
 
 
 def fill_holes(mask):
@@ -111,7 +144,8 @@ def fill_holes(mask):
 
 
 def interior_map(pts, grid, floor_y, walls):
-    slab = pts[np.abs(pts[:, 1] - floor_y) < FLOOR_TOL]
+    rel = pts[:, 1] - floor_y
+    slab = pts[(rel > FLOOR_BAND[0]) & (rel < FLOOR_BAND[1])]
     floor = (grid.occupancy(slab[:, [0, 2]]) > 0).astype(np.uint8)
     floor = cv2.morphologyEx(floor, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
     filled = fill_holes(floor | walls)
@@ -216,7 +250,9 @@ def plan_from_points(pts, cam_y, out_dir: Path):
     floor_y, ceil_y, _, _ = floor_ceiling(pts, cam_y)
     if floor_y is None:
         raise SystemExit("No floor found; cannot build a plan.")
-    band = pts[(pts[:, 1] > floor_y + BAND[0]) & (pts[:, 1] < floor_y + BAND[1])]
+    band = pts[(pts[:, 1] > floor_y + 1.0) & (pts[:, 1] < floor_y + 2.0)]
+    if len(band) < 50_000:            # scan aimed low: align on whatever is above furniture
+        band = pts[(pts[:, 1] > floor_y + 0.5) & (pts[:, 1] < floor_y + 2.0)]
     angle = manhattan_angle(band)
     pts = rot_xz(pts, angle)
 
@@ -266,10 +302,11 @@ def plan_from_points(pts, cam_y, out_dir: Path):
 
     result = {
         "tier": "lidar",
-        "version": "v0",
+        "version": "v0.1",
         "floor_y_m": round(floor_y, 3),
         "global_ceiling_height_m": None if ceil_y is None else round(ceil_y - floor_y, 3),
         "manhattan_angle_deg": round(float(np.rad2deg(angle)), 2),
+        "floor_flatness": floor_flatness(pts, floor_y),
         "grid_cell_m": PX,
         "rooms": [{k: v for k, v in r.items() if not k.startswith("_")} for r in rooms],
         "adjacency": opens,
@@ -293,6 +330,7 @@ def main():
     res = plan_from_points(pts, odo[:, 3], args.out / args.scan.name)
 
     print(f"Manhattan angle: {res['manhattan_angle_deg']} deg")
+    print(f"Floor flatness (vertical drift check): {res['floor_flatness']}")
     print(f"Rooms found: {len(res['rooms'])}")
     for r in res["rooms"]:
         print(f"  R{r['id']}: {r['floor_area_m2']} m2, {r['bbox_m'][0]} x {r['bbox_m'][1]} m, "
