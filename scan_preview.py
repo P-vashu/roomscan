@@ -82,11 +82,16 @@ def fuse(folder, odo, K_rgb, rgb_size, frame_idx, arkit_flip, min_conf=2):
         if K is None:
             K = depth_intrinsics(K_rgb, rgb_size, depth.shape)
         p_cam = backproject(depth, conf, K, min_conf)
-        if arkit_flip:
-            p_cam = p_cam @ CV_TO_ARKIT.T
         T = pose_matrix(odo[i])
-        pts.append(p_cam @ T[:3, :3].T + T[:3, 3])
-    return np.concatenate(pts) if pts else np.zeros((0, 3))
+        # errstate: NumPy 2.0 on Apple Silicon can print false matmul warnings
+        with np.errstate(all="ignore"):
+            if arkit_flip:
+                p_cam = p_cam @ CV_TO_ARKIT.T
+            pts.append(p_cam @ T[:3, :3].T + T[:3, 3])
+    if not pts:
+        return np.zeros((0, 3))
+    pts = np.concatenate(pts)
+    return pts[np.isfinite(pts).all(axis=1)]
 
 
 def voxel_count(pts, size=0.05):
@@ -103,23 +108,34 @@ def pick_convention(folder, odo, K_rgb, rgb_size):
     return min(scores, key=scores.get), scores
 
 
-def floor_ceiling(pts):
-    """Rough floor/ceiling from peaks in the world-Y (gravity-up) histogram."""
+def plane_peak(y, lo, hi, total):
+    """Strongest 1 cm horizontal slab between lo and hi; share is of all points."""
+    sel = y[(y > lo) & (y < hi)]
+    if hi - lo < 0.05 or len(sel) < 1000:
+        return None, 0.0
+    hist, edges = np.histogram(sel, bins=np.arange(lo, hi + 0.01, 0.01))
+    k = int(np.argmax(hist))
+    return float((edges[k] + edges[k + 1]) / 2), float(hist[k] / total)
+
+
+def floor_ceiling(pts, cam_y, min_share=0.005):
+    """Floor must lie below the phone's path and the ceiling above it.
+    Returns None for a surface the scan never really saw."""
     y = pts[:, 1]
     lo, hi = np.percentile(y, [0.05, 99.95])
-    bins = np.arange(lo, hi + 0.01, 0.01)
-    hist, edges = np.histogram(y, bins=bins)
-    centers = (edges[:-1] + edges[1:]) / 2
-    n = len(hist)
-    f = int(np.argmax(hist[: max(n // 3, 1)]))
-    c = n - max(n // 3, 1) + int(np.argmax(hist[n - max(n // 3, 1):]))
-    floor_share = hist[f] / hist.sum()
-    ceil_share = hist[c] / hist.sum()
-    return float(centers[f]), float(centers[c]), float(floor_share), float(ceil_share)
+    floor_y, fs = plane_peak(y, lo, cam_y.min() - 0.3, len(y))
+    ceil_y, cs = plane_peak(y, cam_y.max() + 0.2, hi, len(y))
+    if fs < min_share:
+        floor_y = None
+    if cs < min_share:
+        ceil_y = None
+    return floor_y, ceil_y, fs, cs
 
 
 def topdown(pts, floor_y, ceil_y, path, px=0.01):
-    band = pts[(pts[:, 1] > floor_y + 0.3) & (pts[:, 1] < ceil_y - 0.3)]
+    lo = floor_y + 0.3 if floor_y is not None else np.percentile(pts[:, 1], 5)
+    hi = ceil_y - 0.3 if ceil_y is not None else lo + 1.7
+    band = pts[(pts[:, 1] > lo) & (pts[:, 1] < hi)]
     if len(band) == 0:
         band = pts
     xz = band[:, [0, 2]]
@@ -159,7 +175,7 @@ def main():
     flip, scores = pick_convention(args.scan, odo, K_rgb, rgb_size)
     idx = np.arange(0, len(odo), args.step)
     pts = fuse(args.scan, odo, K_rgb, rgb_size, idx, flip)
-    floor_y, ceil_y, fs, cs = floor_ceiling(pts)
+    floor_y, ceil_y, fs, cs = floor_ceiling(pts, odo[:, 3])
 
     out = args.out / args.scan.name
     out.mkdir(parents=True, exist_ok=True)
@@ -177,9 +193,13 @@ def main():
         "points": int(len(pts)),
         "arkit_axis_flip": bool(flip),
         "convention_scores": {str(k): round(v, 4) for k, v in scores.items()},
-        "floor_y_m": round(floor_y, 3),
-        "ceiling_y_m": round(ceil_y, 3),
-        "rough_ceiling_height_m": round(ceil_y - floor_y, 3),
+        "camera_y_range_m": [round(float(odo[:, 3].min()), 3), round(float(odo[:, 3].max()), 3)],
+        "floor_y_m": None if floor_y is None else round(floor_y, 3),
+        "ceiling_y_m": None if ceil_y is None else round(ceil_y, 3),
+        "rough_ceiling_height_m": (None if floor_y is None or ceil_y is None
+                                   else round(ceil_y - floor_y, 3)),
+        "phone_height_above_floor_m": (None if floor_y is None
+                                       else round(float(np.median(odo[:, 3])) - floor_y, 3)),
         "floor_peak_share": round(fs, 3),
         "ceiling_peak_share": round(cs, 3),
         "topdown_extent_m": [round(w, 2), round(d, 2)],
